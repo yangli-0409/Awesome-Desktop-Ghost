@@ -49,7 +49,7 @@ Trade-offs while something is hidden:
 
 ### Teleprompter
 
-Menu bar **👻 → 提词器 → 选择窗口…** puts a live copy of any window (or a part of it you frame by dragging) in a small panel right under the camera, so your eyes stay near the lens while you read notes on a call or in a recording. The panel is never captured: shares and recordings don't show it, and the original window can sit anywhere, even behind other windows (what's shared is whatever covers it). Drag the panel to move it, drag its edges to resize; 👻 → 提词器 → 回到摄像头下方 snaps it back. It is a picture: scroll and edit in the original window.
+Menu bar **👻 → 提词器 → 选择窗口…** puts a live copy of any window (or a part of it you frame by dragging) in a small panel right under the camera, so your eyes stay near the lens while you read notes on a call or in a recording. The panel is never captured: shares and recordings don't show it, and the original window can sit anywhere, even behind other windows (what's shared is whatever covers it). Drag the panel to move it, drag its edges to resize, click the × that shows in its corner on hover to close it; 👻 → 提词器 → 回到摄像头下方 snaps it back. It is a picture: scroll and edit in the original window.
 
 It captures only the framed region, at the panel's size and 10 fps (5 fps when the Mac runs hot or in Low Power Mode), and skips frames where nothing changed. On an M5 Pro with a still document: about +4% of a core for the window server and +1% for Ghost, against +18–35% and 10% for hide mode.
 

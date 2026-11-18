@@ -1431,7 +1431,8 @@ final class Watchdog {
 // your eyes stay near the lens while you read. The panel is never captured
 // (sharingType .none): shares and recordings don't show it, and the original
 // window can sit anywhere, even behind other windows — what's shared is
-// whatever covers it. It is a picture: scroll and edit in the original.
+// whatever covers it. It is a picture: scroll and edit in the original. An ×
+// shows in its corner while the mouse is over it.
 //
 // Cost: one capture of that part of the screen, with only that window in it, at
 // the panel's size and 10 fps (5 when the Mac is hot or in Low Power Mode);
@@ -1449,6 +1450,48 @@ func cameraScreen() -> NSScreen? {
 
 final class PrompterPanel: NSPanel {
     override var canBecomeKey: Bool { false }
+}
+
+/// Takes the click that reaches a background app's panel, instead of only waking it.
+final class FirstClickButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// The panel's content: the picture, plus a close button that shows while the mouse is over it.
+final class PrompterView: NSView {
+    private let close = FirstClickButton()
+    var onClose: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        close.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "关闭提词器")?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .bold))
+        close.isBordered = false
+        close.imagePosition = .imageOnly
+        close.contentTintColor = .white
+        close.wantsLayer = true
+        close.layer!.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
+        close.layer!.cornerRadius = 11
+        close.frame = NSRect(x: frame.width - 30, y: frame.height - 30, width: 22, height: 22)
+        close.autoresizingMask = [.minXMargin, .minYMargin]
+        close.target = self
+        close.action = #selector(tapClose)
+        close.toolTip = "关闭提词器"
+        close.alphaValue = 0
+        addSubview(close)
+    }
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self))
+        super.updateTrackingAreas()
+    }
+    override func mouseEntered(with e: NSEvent) { close.animator().alphaValue = 1 }
+    override func mouseExited(with e: NSEvent) { close.animator().alphaValue = 0 }
+    @objc private func tapClose() { onClose?() }
 }
 
 final class Teleprompter: NSObject, SCStreamOutput, SCStreamDelegate, NSWindowDelegate {
@@ -1535,8 +1578,8 @@ final class Teleprompter: NSObject, SCStreamOutput, SCStreamDelegate, NSWindowDe
         p.contentAspectRatio = c.size
         p.alphaValue = opacity
         p.delegate = self
-        let v = NSView(frame: NSRect(origin: .zero, size: size))
-        v.wantsLayer = true
+        let v = PrompterView(frame: NSRect(origin: .zero, size: size))
+        v.onClose = { [weak self] in self?.stop() }
         v.layer!.backgroundColor = NSColor(white: 0.1, alpha: 1).cgColor
         v.layer!.cornerRadius = 10
         v.layer!.masksToBounds = true
@@ -1544,7 +1587,7 @@ final class Teleprompter: NSObject, SCStreamOutput, SCStreamDelegate, NSWindowDe
         picture.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         picture.contentsGravity = .resizeAspect
         picture.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
-        v.layer!.addSublayer(picture)
+        v.layer!.insertSublayer(picture, at: 0)      // under the close button
         p.contentView = v
         panel = p
         snapUnderCamera()
