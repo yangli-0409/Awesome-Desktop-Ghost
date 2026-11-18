@@ -29,7 +29,7 @@ Multiple windows can be ghosted at different levels.
 
 Menu bar **👻 → 共享/录屏时隐藏** switches modes: ghosted windows stay visible to you at their opacity, but disappear from screen sharing, recordings and screenshots (Zoom, Meet, Teams, Cap, QuickTime, ⇧⌘3 …). Everyone else sees what is behind the window.
 
-How: while a window is hidden, Ghost covers each display with a full-screen capture of the screen *without* that app, which only captures see, and shows you a second, local-only capture of the real screen on top, with the hidden window blended in. Because the cover is full-screen, dragging, jumping, minimizing or switching Spaces can't uncover the window. A hidden app's menus, sheets and popovers are left out from their first frame; its unrelated windows stay visible to viewers (a newly opened one may appear a moment late). The cursor is hidden from captures while it's over a hidden window.
+How: while a window is hidden, Ghost covers each display with a full-screen capture of the screen *without* that app, which only captures see, and shows you a second, local-only capture of the real screen on top, with the hidden window blended in. Because the cover is full-screen, dragging, jumping, minimizing or switching Spaces can't uncover the window. A hidden app's menus, sheets and popovers are left out from their first frame; its unrelated windows stay visible to viewers (a newly opened one may appear a moment late). While the cursor is over a hidden window, captures see a plain arrow following it instead of its real shape (an I-beam or a hand would give text fields and links away); turn 👻 → 鼠标在隐藏窗口上时，共享里显示为普通箭头 off to hide the cursor there altogether.
 
 **Which sharing tools it works with.** Hiding relies on the capture tool honouring macOS's "don't capture this window" flag, which everything built on ScreenCaptureKit does:
 
@@ -46,6 +46,12 @@ Trade-offs while something is hidden:
 - your whole screen is shown through a capture, about one display frame late, at 60 fps (30 fps when the Mac runs hot or is in Low Power Mode), and the window server works noticeably harder (≈ half a CPU core on an M-series Mac); on a slow Mac Ghost also tracks windows less often, which only affects how closely the see-through area follows a dragged window, never what shares see;
 - DRM-protected video (Netflix, Apple TV) can't be captured, so it may show black to you as well;
 - quitting Ghost from the menu warns you first: hidden windows reappear in shares once it's gone.
+
+### Teleprompter
+
+Menu bar **👻 → 提词器 → 选择窗口…** puts a live copy of any window (or a part of it you frame by dragging) in a small panel right under the camera, so your eyes stay near the lens while you read notes on a call or in a recording. The panel is never captured: shares and recordings don't show it, and the original window can sit anywhere, even behind other windows (what's shared is whatever covers it). Drag the panel to move it, drag its edges to resize, click the × that shows in its corner on hover to close it; 👻 → 提词器 → 回到摄像头下方 snaps it back. It is a picture: scroll and edit in the original window.
+
+It captures only the framed region, at the panel's size and 10 fps (5 fps when the Mac runs hot or in Low Power Mode), and skips frames where nothing changed. On an M5 Pro with a still document: about +4% of a core for the window server and +1% for Ghost, against +18–35% and 10% for hide mode.
 
 ## Install
 

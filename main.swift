@@ -791,14 +791,25 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
-/// Over a hidden window, a share would show the cursor moving and clicking over
-/// nothing (and its I-beam would give text fields away). While the mouse is over
+/// Over a hidden window, a share would show the cursor's real shape over nothing:
+/// an I-beam or a hand gives text fields and links away. While the mouse is over
 /// one, hide the system cursor — a private SkyLight switch lets a background app
-/// do that — and draw a local-only copy. The window server brings the real cursor
+/// do that — and draw a local-only copy for you. Shares then see, by default
+/// (arrowInShares), a plain arrow following the mouse, drawn in a captured window
+/// just above the cover; otherwise no cursor at all, which shows as the cursor
+/// vanishing there. Under the hidden window's see-through area you may notice that
+/// arrow faintly behind your own cursor. The window server brings the real cursor
 /// back by itself if Ghost exits.
 final class CursorCloak {
     private let win: NSWindow
     private let image = NSImageView()
+    private let decoy: NSWindow                   // what shares see: a plain arrow
+    var arrowInShares = UserDefaults.standard.object(forKey: "ArrowInShares") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(arrowInShares, forKey: "ArrowInShares")
+            if hidden { arrowInShares ? showDecoy() : decoy.orderOut(nil) }
+        }
+    }
     private var hidden = false
     private var shown: NSCursor?
     private var monitor: Any?
@@ -826,6 +837,35 @@ final class CursorCloak {
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
         image.imageScaling = .scaleAxesIndependently
         win.contentView = image
+
+        let arrow = NSCursor.arrow
+        decoy = NSWindow(contentRect: NSRect(origin: .zero, size: arrow.image.size), styleMask: .borderless,
+                         backing: .buffered, defer: false)
+        decoy.isOpaque = false
+        decoy.backgroundColor = .clear
+        decoy.hasShadow = false
+        decoy.ignoresMouseEvents = true
+        decoy.sharingType = .readOnly
+        decoy.level = shieldLevel                     // with the cover, ordered above it; under your view
+        decoy.animationBehavior = .none
+        decoy.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
+        let iv = NSImageView(frame: NSRect(origin: .zero, size: arrow.image.size))
+        iv.image = arrow.image
+        iv.imageScaling = .scaleAxesIndependently
+        decoy.contentView = iv
+    }
+
+    /// A shield's cover was just put on screen: keep the arrow above it.
+    func raise() { if hidden && arrowInShares { decoy.orderFrontRegardless() } }
+
+    private func showDecoy() {
+        placeDecoy(NSEvent.mouseLocation)
+        decoy.orderFrontRegardless()
+    }
+
+    private func placeDecoy(_ m: NSPoint) {
+        let a = NSCursor.arrow
+        decoy.setFrameOrigin(NSPoint(x: m.x - a.hotSpot.x, y: m.y - (a.image.size.height - a.hotSpot.y)))
     }
 
     var window: NSWindow { win }
@@ -842,6 +882,7 @@ final class CursorCloak {
     func stop() { if hidden { uncloak() } }
 
     private func place(_ m: NSPoint) {
+        if arrowInShares { placeDecoy(m) }
         guard let c = NSCursor.currentSystem else { return }
         let size = c.image.size
         if c !== shown {
@@ -858,6 +899,7 @@ final class CursorCloak {
         CGDisplayHideCursor(kCGNullDirectDisplay)
         place(NSEvent.mouseLocation)
         win.orderFrontRegardless()
+        if arrowInShares { showDecoy() }
         monitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
         ) { [weak self] _ in self?.place(NSEvent.mouseLocation) }
@@ -867,6 +909,7 @@ final class CursorCloak {
         hidden = false
         CGDisplayShowCursor(kCGNullDirectDisplay)
         win.orderOut(nil)
+        decoy.orderOut(nil)
         if let m = monitor { NSEvent.removeMonitor(m) }
         monitor = nil
         shown = nil
@@ -1054,6 +1097,7 @@ final class ShareShield {
                     shields[id] = s
                     s.wantInView(ownWindows)
                     s.start(keys: keys)
+                    cursor.raise()
                 }
                 layoutAll()
             }
@@ -1070,6 +1114,7 @@ final class ShareShield {
         }
         fresh.wantInView(ownWindows)
         fresh.start(keys: keys)
+        cursor.raise()
         var check: Timer?
         check = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             guard let self else { check?.invalidate(); return }
@@ -1425,6 +1470,351 @@ final class Watchdog {
     }
 }
 
+// MARK: - Teleprompter
+//
+// A copy of (part of) any window in a small panel right under the camera, so
+// your eyes stay near the lens while you read. The panel is never captured
+// (sharingType .none): shares and recordings don't show it, and the original
+// window can sit anywhere, even behind other windows — what's shared is
+// whatever covers it. It is a picture: scroll and edit in the original. An ×
+// shows in its corner while the mouse is over it.
+//
+// Cost: one capture of that part of the screen, with only that window in it, at
+// the panel's size and 10 fps (5 when the Mac is hot or in Low Power Mode);
+// frames where nothing changed don't touch the panel. Measured on an M5 Pro with
+// a still document: about +2% of a core for the window server, +0.5% for Ghost
+// (capturing the window itself instead cost the window server +6%).
+
+/// The display with the built-in camera (the notched one), else the main display.
+func cameraScreen() -> NSScreen? {
+    NSScreen.screens.first {
+        guard let n = $0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return false }
+        return CGDisplayIsBuiltin(n.uint32Value) != 0
+    } ?? NSScreen.screens.first
+}
+
+final class PrompterPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+}
+
+/// Takes the click that reaches a background app's panel, instead of only waking it.
+final class FirstClickButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// The panel's content: the picture, plus a close button that shows while the mouse is over it.
+final class PrompterView: NSView {
+    private let close = FirstClickButton()
+    var onClose: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        close.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "关闭提词器")?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .bold))
+        close.isBordered = false
+        close.imagePosition = .imageOnly
+        close.contentTintColor = .white
+        close.wantsLayer = true
+        close.layer!.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
+        close.layer!.cornerRadius = 11
+        close.frame = NSRect(x: frame.width - 30, y: frame.height - 30, width: 22, height: 22)
+        close.autoresizingMask = [.minXMargin, .minYMargin]
+        close.target = self
+        close.action = #selector(tapClose)
+        close.toolTip = "关闭提词器"
+        close.alphaValue = 0
+        addSubview(close)
+    }
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self))
+        super.updateTrackingAreas()
+    }
+    override func mouseEntered(with e: NSEvent) { close.animator().alphaValue = 1 }
+    override func mouseExited(with e: NSEvent) { close.animator().alphaValue = 0 }
+    @objc private func tapClose() { onClose?() }
+}
+
+final class Teleprompter: NSObject, SCStreamOutput, SCStreamDelegate, NSWindowDelegate {
+    private var panel: PrompterPanel?
+    private let picture = CALayer()
+    private var stream: SCStream?
+    private var window: SCWindow?
+    private var display: SCDisplay?
+    private var displays: [SCDisplay] = []
+    private var bounds = CGRect.zero             // the window's frame, CG coordinates
+    private var crop = CGRect.zero               // in the window, points, origin top-left
+    private var follow: Timer?
+    private let queue = DispatchQueue(label: "ghost.prompter", qos: .userInteractive)
+    private let lock = NSLock()
+    private var pending: IOSurface?               // guarded by lock
+    private var scheduled = false                 // guarded by lock
+    private var powerObservers: [NSObjectProtocol] = []
+    private var hasPicture = false                // touched on the capture queue only
+    var onEnded: (() -> Void)?
+
+    var isActive: Bool { panel != nil }
+    var opacity: CGFloat = CGFloat(UserDefaults.standard.object(forKey: "PrompterOpacity") as? Double ?? 0.9) {
+        didSet { UserDefaults.standard.set(Double(opacity), forKey: "PrompterOpacity"); panel?.alphaValue = opacity }
+    }
+    private var fps: Int { shieldFPS() < 60 ? 5 : 10 }
+
+    /// Mirror `crop` of window `id` (whole window if nil).
+    func start(windowID id: CGWindowID, crop wanted: CGRect?) {
+        stop()
+        Task {
+            guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false),
+                  let w = content.windows.first(where: { $0.windowID == id }) else { return }
+            await MainActor.run {
+                self.displays = content.displays
+                let full = CGRect(origin: .zero, size: w.frame.size)
+                let c = (wanted ?? full).intersection(full)
+                self.show(w, crop: c.width >= 40 && c.height >= 40 ? c : full)
+            }
+        }
+    }
+
+    func stop() {
+        follow?.invalidate()
+        follow = nil
+        powerObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        powerObservers = []
+        if let s = stream { Task { try? await s.stopCapture() } }
+        stream = nil
+        window = nil
+        display = nil
+        panel?.orderOut(nil)
+        panel = nil
+    }
+
+    /// Back to the top-centre of the camera's screen, just under the menu bar.
+    func snapUnderCamera() {
+        guard let p = panel, let scr = cameraScreen() else { return }
+        p.setFrameOrigin(NSPoint(x: scr.frame.midX - p.frame.width / 2, y: scr.visibleFrame.maxY - p.frame.height - 4))
+    }
+
+    private func show(_ w: SCWindow, crop c: CGRect) {
+        window = w
+        crop = c
+        bounds = w.frame
+        guard let d = displayFor(bounds) else { return }
+        display = d
+        let scr = cameraScreen()
+        let maxW = min(560, (scr?.visibleFrame.width ?? 1000) * 0.5)
+        let maxH = (scr?.visibleFrame.height ?? 800) * 0.35
+        let width = CGFloat(UserDefaults.standard.object(forKey: "PrompterWidth") as? Double ?? Double(min(c.width, maxW)))
+        var size = NSSize(width: width, height: width * c.height / c.width)
+        if size.height > maxH { size = NSSize(width: maxH * c.width / c.height, height: maxH) }
+
+        let p = PrompterPanel(contentRect: NSRect(origin: .zero, size: size),
+                              styleMask: [.borderless, .nonactivatingPanel, .resizable], backing: .buffered, defer: false)
+        p.level = NSWindow.Level(rawValue: shieldLevel.rawValue + 2)   // above hide mode's overlays
+        p.sharingType = .none                       // never in a share or recording
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = false                          // a shadow on a changing, non-opaque panel costs ~2% of a core
+        p.isMovableByWindowBackground = true
+        p.hidesOnDeactivate = false
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        p.contentAspectRatio = c.size
+        p.alphaValue = opacity
+        p.delegate = self
+        let v = PrompterView(frame: NSRect(origin: .zero, size: size))
+        v.onClose = { [weak self] in self?.stop() }
+        v.layer!.backgroundColor = NSColor(white: 0.1, alpha: 1).cgColor
+        v.layer!.cornerRadius = 10
+        v.layer!.masksToBounds = true
+        picture.frame = v.bounds
+        picture.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        picture.contentsGravity = .resizeAspect
+        picture.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
+        v.layer!.insertSublayer(picture, at: 0)      // under the close button
+        p.contentView = v
+        panel = p
+        snapUnderCamera()
+        p.orderFrontRegardless()
+
+        powerObservers = [ProcessInfo.thermalStateDidChangeNotification, .NSProcessInfoPowerStateDidChange].map {
+            NotificationCenter.default.addObserver(forName: $0, object: nil, queue: .main) { [weak self] _ in self?.reconfigure() }
+        }
+        // Capture the screen region where the crop is, with only that window in it:
+        // cheaper than capturing the window itself, and other windows covering it
+        // don't matter. The region follows the window (followWindow).
+        let s = SCStream(filter: SCContentFilter(display: d, including: [w]), configuration: config(), delegate: self)
+        do { try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue) } catch { stop(); return }
+        stream = s
+        queue.async { self.hasPicture = false }
+        Task { do { try await s.startCapture() } catch { await MainActor.run { self.ended() } } }
+        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.followWindow() }
+        RunLoop.main.add(t, forMode: .common)
+        follow = t
+    }
+
+    private func displayFor(_ r: CGRect) -> SCDisplay? {
+        displays.first { $0.frame.contains(CGPoint(x: r.midX, y: r.midY)) }
+            ?? displays.max { $0.frame.intersection(r).width * $0.frame.intersection(r).height
+                              < $1.frame.intersection(r).width * $1.frame.intersection(r).height }
+    }
+
+    /// Twice a second: move the captured region with the window; switch displays with it; end when it closes.
+    private func followWindow() {
+        guard let w = window, let s = stream else { return }
+        guard let info = windowInfo(w.windowID) else { ended(); return }      // closed
+        guard info.onScreen, info.bounds != bounds else { return }
+        bounds = info.bounds
+        if let d = displayFor(bounds), d.displayID != display?.displayID {
+            display = d
+            let f = SCContentFilter(display: d, including: [w])
+            let c = config()
+            Task { try? await s.updateContentFilter(f); try? await s.updateConfiguration(c) }
+        } else {
+            reconfigure()
+        }
+    }
+
+    /// Output at the panel's size, not the window's: no more pixels than are shown.
+    private func config() -> SCStreamConfiguration {
+        let c = SCStreamConfiguration()
+        let d = display?.frame ?? .zero
+        c.sourceRect = CGRect(x: bounds.minX - d.minX + crop.minX, y: bounds.minY - d.minY + crop.minY,
+                              width: crop.width, height: crop.height)
+        let scale = panel?.backingScaleFactor ?? 2
+        let size = panel?.frame.size ?? crop.size
+        c.width = max(Int(size.width * scale), 64)
+        c.height = max(Int(size.height * scale), 64)
+        c.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        c.pixelFormat = kCVPixelFormatType_32BGRA
+        c.showsCursor = false
+        c.queueDepth = 3
+        if let name = panel?.screen?.colorSpace?.cgColorSpace?.name { c.colorSpaceName = name }
+        return c
+    }
+
+    private func reconfigure() {
+        guard let s = stream else { return }
+        let c = config()
+        Task { try? await s.updateConfiguration(c) }
+    }
+
+    private func ended() {
+        guard panel != nil else { return }
+        stop()
+        onEnded?()
+    }
+
+    // NSWindowDelegate
+    func windowDidEndLiveResize(_ n: Notification) {
+        if let p = panel { UserDefaults.standard.set(Double(p.frame.width), forKey: "PrompterWidth") }
+        reconfigure()
+    }
+
+    // SCStreamOutput: keep only the newest frame if the main thread falls behind.
+    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sb.isValid,
+              let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let raw = atts.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
+              let pb = CMSampleBufferGetImageBuffer(sb), let surface = CVPixelBufferGetIOSurface(pb)?.takeUnretainedValue()
+        else { return }
+        // A still window still comes at the full rate; skip frames where nothing changed,
+        // so the panel isn't recomposited for nothing.
+        if let dirty = atts.first?[.dirtyRects] as? [Any], dirty.isEmpty, hasPicture { return }
+        hasPicture = true
+        lock.lock()
+        pending = surface
+        let go = !scheduled
+        scheduled = true
+        lock.unlock()
+        guard go else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let s = self.pending
+            self.pending = nil
+            self.scheduled = false
+            self.lock.unlock()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.picture.contents = s
+            CATransaction.commit()
+        }
+    }
+
+    // SCStreamDelegate: the window closed (or capture stopped).
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        DispatchQueue.main.async { [weak self] in self?.ended() }
+    }
+}
+
+/// Lets you drag a rectangle over a window to pick what the teleprompter shows.
+/// Return or a click without dragging takes the whole window; Esc cancels.
+final class RegionPicker: NSWindow {
+    private var done: ((CGRect??) -> Void)?
+    private let box = CAShapeLayer()
+    private var anchor: NSPoint?
+    private var rect: NSRect?
+
+    /// `bounds`: the window's frame, CG coordinates. Calls back with the crop in
+    /// the window (points, origin top-left), nil for the whole window, or .none if cancelled.
+    static func pick(over bounds: CGRect, _ done: @escaping (CGRect??) -> Void) {
+        let w = RegionPicker(contentRect: cocoaRect(bounds), styleMask: .borderless, backing: .buffered, defer: false)
+        w.done = done
+        w.level = NSWindow.Level(rawValue: shieldLevel.rawValue + 3)
+        w.sharingType = .none
+        w.isOpaque = false
+        w.backgroundColor = NSColor.black.withAlphaComponent(0.35)
+        w.isReleasedWhenClosed = false
+        let v = NSView(frame: NSRect(origin: .zero, size: bounds.size))
+        v.wantsLayer = true
+        let hint = NSTextField(labelWithString: "拖动框出要放进提词器的区域 · 回车用整个窗口 · Esc 取消")
+        hint.font = .systemFont(ofSize: 15, weight: .semibold)
+        hint.textColor = .white
+        hint.sizeToFit()
+        hint.frame.origin = NSPoint(x: (bounds.width - hint.frame.width) / 2, y: bounds.height - hint.frame.height - 16)
+        v.addSubview(hint)
+        w.box.fillColor = NSColor.white.withAlphaComponent(0.15).cgColor
+        w.box.strokeColor = NSColor.white.cgColor
+        w.box.lineWidth = 2
+        w.box.actions = ["path": NSNull()]
+        v.layer!.addSublayer(w.box)
+        w.contentView = v
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    override var canBecomeKey: Bool { true }
+
+    override func mouseDown(with e: NSEvent) { anchor = e.locationInWindow; rect = nil }
+    override func mouseDragged(with e: NSEvent) {
+        guard let a = anchor else { return }
+        let p = e.locationInWindow
+        let r = NSRect(x: min(a.x, p.x), y: min(a.y, p.y), width: abs(p.x - a.x), height: abs(p.y - a.y))
+            .intersection(NSRect(origin: .zero, size: frame.size))
+        rect = r
+        box.path = CGPath(rect: r, transform: nil)
+    }
+    override func mouseUp(with e: NSEvent) {
+        guard let r = rect, r.width >= 40, r.height >= 40 else { return }   // a click: keep waiting
+        finish(CGRect(x: r.minX, y: frame.height - r.maxY, width: r.width, height: r.height))
+    }
+    override func keyDown(with e: NSEvent) {
+        switch e.keyCode {
+        case 53: finish(.none)                    // Esc
+        case 36, 76: finish(.some(nil))           // Return: whole window
+        default: super.keyDown(with: e)
+        }
+    }
+    private func finish(_ r: CGRect??) {
+        orderOut(nil)
+        let d = done
+        done = nil
+        d?(r)
+    }
+}
+
 // MARK: - Hover slider HUD
 
 final class HUDPanel: NSPanel {
@@ -1496,6 +1886,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotKeyRef: EventHotKeyRef?
 
     private let hud = HUDPanel()
+    private let prompter = Teleprompter()
     private var hudTarget: WinInfo?
     private var hoverTimer: Timer?
     private var hoverCandidate: CGWindowID?
@@ -1773,11 +2164,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let hide = NSMenuItem(title: "共享/录屏时隐藏（只有你能看到）", action: #selector(toggleHideInShares), keyEquivalent: "")
         hide.state = hideInShares ? .on : .off
         menu.addItem(hide)
+        if hideInShares {
+            let arrow = NSMenuItem(title: "    鼠标在隐藏窗口上时，共享里显示为普通箭头", action: #selector(toggleArrowInShares), keyEquivalent: "")
+            arrow.state = shield.cursor.arrowInShares ? .on : .off
+            arrow.toolTip = "关掉后，共享和录屏里鼠标经过隐藏窗口时会消失"
+            menu.addItem(arrow)
+        }
 
         let count = ghosts.count + shield.targets.count
         if count > 0 {
             menu.addItem(withTitle: "全部恢复 (\(count))", action: #selector(restoreAllAction), keyEquivalent: "")
         }
+
+        menu.addItem(prompterMenuItem())
 
         let login = NSMenuItem(title: "登录时自动启动", action: #selector(toggleLoginItem), keyEquivalent: "")
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -1806,12 +2205,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleHideInShares() { setHideInShares(!hideInShares) }
+    @objc private func toggleArrowInShares() { shield.cursor.arrowInShares.toggle() }
 
     @objc private func setDefaultOpacity(_ sender: NSMenuItem) {
         defaultOpacity = CGFloat(sender.tag) / 100
     }
 
     @objc private func restoreAllAction() { restoreAll() }
+
+    // MARK: teleprompter
+
+    private func prompterMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: prompter.isActive ? "提词器（开启中）" : "提词器：放到摄像头下方", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        let pick = NSMenuItem(title: "选择窗口…", action: nil, keyEquivalent: "")
+        let wins = NSMenu()
+        for w in onScreenWindows().prefix(30) {
+            let it = NSMenuItem(title: String(w.label.prefix(60)), action: #selector(startPrompter(_:)), keyEquivalent: "")
+            it.representedObject = w.id
+            wins.addItem(it)
+        }
+        pick.submenu = wins
+        sub.addItem(pick)
+        if prompter.isActive {
+            sub.addItem(withTitle: "回到摄像头下方", action: #selector(snapPrompter), keyEquivalent: "")
+            sub.addItem(withTitle: "关闭提词器", action: #selector(stopPrompter), keyEquivalent: "")
+        }
+        let op = NSMenuItem(title: "透明度", action: nil, keyEquivalent: "")
+        let ops = NSMenu()
+        for p in [50, 60, 70, 80, 90, 100] {
+            let it = NSMenuItem(title: "\(p)%", action: #selector(setPrompterOpacity(_:)), keyEquivalent: "")
+            it.tag = p
+            it.state = Int((prompter.opacity * 100).rounded()) == p ? .on : .off
+            ops.addItem(it)
+        }
+        op.submenu = ops
+        sub.addItem(op)
+        let note = NSMenuItem(title: "只有你能看到；在原窗口里滚动和编辑", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        sub.addItem(note)
+        item.submenu = sub
+        return item
+    }
+
+    @objc private func startPrompter(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? CGWindowID, ensurePermission(),
+              let w = onScreenWindows().first(where: { $0.id == id }) else { return }
+        shield.rescanSoon()                           // the picker shows in the local view while hiding
+        NSRunningApplication(processIdentifier: w.pid)?.activate()   // so you see what you're framing
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            RegionPicker.pick(over: w.bounds) { [weak self] crop in
+                guard let self, let crop else { return }  // cancelled
+                self.prompter.start(windowID: id, crop: crop)
+            }
+        }
+    }
+
+    @objc private func snapPrompter() { prompter.snapUnderCamera() }
+    @objc private func stopPrompter() { prompter.stop() }
+    @objc private func setPrompterOpacity(_ sender: NSMenuItem) { prompter.opacity = CGFloat(sender.tag) / 100 }
 
     @objc private func toggleLoginItem() {
         do {
