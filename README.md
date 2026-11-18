@@ -91,9 +91,10 @@ open /Applications/Ghost.app
 A native Windows port lives in [`windows/`](windows/). It does **not** use the screen-capture-and-overlay trick the macOS build needs — Windows exposes the APIs directly:
 
 - **Transparency** via layered windows (`WS_EX_LAYERED` + `SetLayeredWindowAttributes`), so the real window becomes see-through; no capture, no overlay.
-- **Hide from screen sharing** via `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`. That call only affects the calling process's own windows, so Ghost injects a tiny helper DLL (`ghost_inject.dll`) into the target, which applies the flag and then unloads itself.
+- **Hide from screen sharing** via `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`. That call only affects the calling process's own windows, so Ghost injects a tiny helper DLL (`ghost_inject.dll`) into the target, which applies the flag and then unloads itself. Ghost doesn't touch the pointer, so shares keep showing it over a hidden window, with its real shape.
+- **Teleprompter** via a DWM thumbnail: the compositor draws the live copy, so it costs next to nothing, and the panel is excluded from capture like the slider.
 
-Same interactions as macOS: hover a title bar ~0.3 s for the opacity slider (20 %–100 %, 100 % restores), **Ctrl+Alt+T** toggles the foreground window, and a tray icon 👻 lists windows, sets the default opacity, toggles hide-from-capture, restores all, and runs at login.
+Same interactions as macOS: hover a title bar ~0.3 s for the opacity slider (20 %–100 %, 100 % restores), **Ctrl+Alt+T** toggles the foreground window, and a tray icon 👻 lists windows, sets the default opacity, toggles hide-from-capture, restores all, and runs at login. Tray **👻 → 提词器 → 选择窗口…** opens the same teleprompter as on macOS, at the top centre of the primary screen.
 
 ### Install (Windows)
 

@@ -9,6 +9,7 @@
 
 mod hud;
 mod inject;
+mod prompter;
 mod win;
 
 use std::cell::RefCell;
@@ -38,10 +39,15 @@ const IDM_HIDE: usize = 100;
 const IDM_RESTORE_ALL: usize = 101;
 const IDM_STARTUP: usize = 102;
 const IDM_EXIT: usize = 103;
+const IDM_PROMPT_SNAP: usize = 104;
+const IDM_PROMPT_STOP: usize = 105;
 const IDM_DEF_BASE: usize = 200; // + percent (30..=90)
+const IDM_PROMPT_OP_BASE: usize = 300; // + percent (50..=100)
 const IDM_WIN_BASE: usize = 1000; // + index into menu_windows
+const IDM_PROMPT_WIN_BASE: usize = 2000; // + index into menu_windows
 
 const DEFAULT_PERCENTS: [u8; 7] = [30, 40, 50, 60, 70, 80, 90];
+const PROMPT_PERCENTS: [u8; 6] = [50, 60, 70, 80, 90, 100];
 const HOVER_MS: u64 = 300;
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Ghost";
@@ -115,6 +121,7 @@ fn main() {
         .expect("create message window");
 
         hud::register_class(hinst);
+        prompter::register_classes(hinst);
 
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
@@ -204,6 +211,7 @@ extern "system" fn msg_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 LRESULT(0)
             }
             WM_DESTROY => {
+                prompter::exit();
                 restore_all();
                 remove_tray_icon(hwnd.0 as isize);
                 PostQuitMessage(0);
@@ -223,6 +231,8 @@ fn own_hwnds() -> Vec<isize> {
 fn show_menu(hwnd: HWND) {
     unsafe {
         let menu = CreatePopupMenu().unwrap();
+        // Snapshot the window list so command ids map back to hwnds.
+        let wins = win::top_level_windows(&own_hwnds());
 
         append_disabled(menu, "悬停窗口标题栏 → 滑块 ｜ ⌃⌥T 切换前台窗口");
 
@@ -244,6 +254,8 @@ fn show_menu(hwnd: HWND) {
         let hflags = if hide_on { MF_STRING | MF_CHECKED } else { MF_STRING };
         let _ = AppendMenuW(menu, hflags, IDM_HIDE, w!("共享/录屏时隐藏（只有你能看到）"));
 
+        append_prompter_menu(menu, &wins);
+
         let count = with_app(|a| a.ghosts.len());
         if count > 0 {
             let _ = AppendMenuW(
@@ -260,8 +272,6 @@ fn show_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         append_disabled(menu, "窗口（点击 = 切换）");
 
-        // Snapshot the window list so command ids map back to hwnds.
-        let wins = win::top_level_windows(&own_hwnds());
         for (i, wi) in wins.iter().take(30).enumerate() {
             let ghosted = with_app(|a| a.ghosts.iter().find(|g| g.hwnd == wi.hwnd).map(|g| g.percent));
             let mut label: String = wi.title.chars().take(60).collect();
@@ -297,6 +307,33 @@ fn show_menu(hwnd: HWND) {
     }
 }
 
+fn append_prompter_menu(menu: HMENU, wins: &[win::WinInfo]) {
+    unsafe {
+        let sub = CreatePopupMenu().unwrap();
+        let pick = CreatePopupMenu().unwrap();
+        for (i, wi) in wins.iter().take(30).enumerate() {
+            let label: String = wi.title.chars().take(60).collect();
+            let _ = AppendMenuW(pick, MF_STRING, IDM_PROMPT_WIN_BASE + i, wtext(&label));
+        }
+        let _ = AppendMenuW(sub, MF_POPUP, pick.0 as usize, w!("选择窗口…"));
+        let active = prompter::is_active();
+        if active {
+            let _ = AppendMenuW(sub, MF_STRING, IDM_PROMPT_SNAP, w!("回到摄像头下方"));
+            let _ = AppendMenuW(sub, MF_STRING, IDM_PROMPT_STOP, w!("关闭提词器"));
+        }
+        let ops = CreatePopupMenu().unwrap();
+        let cur = prompter::opacity();
+        for p in PROMPT_PERCENTS {
+            let flags = if p == cur { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(ops, flags, IDM_PROMPT_OP_BASE + p as usize, wtext(&format!("{p}%")));
+        }
+        let _ = AppendMenuW(sub, MF_POPUP, ops.0 as usize, w!("透明度"));
+        append_disabled(sub, "只有你能看到；在原窗口里滚动和编辑");
+        let title = if active { w!("提词器（开启中）") } else { w!("提词器：放到摄像头下方") };
+        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, title);
+    }
+}
+
 fn append_disabled(menu: HMENU, text: &str) {
     unsafe {
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, wtext(text));
@@ -317,6 +354,17 @@ fn dispatch_command(cmd: usize) {
         },
         _ if (IDM_DEF_BASE + 20..IDM_DEF_BASE + 100).contains(&cmd) => {
             with_app(|a| a.default_percent = (cmd - IDM_DEF_BASE) as u8);
+        }
+        IDM_PROMPT_SNAP => prompter::snap(),
+        IDM_PROMPT_STOP => prompter::stop(),
+        _ if (IDM_PROMPT_OP_BASE + 50..=IDM_PROMPT_OP_BASE + 100).contains(&cmd) => {
+            prompter::set_opacity((cmd - IDM_PROMPT_OP_BASE) as u8);
+        }
+        _ if cmd >= IDM_PROMPT_WIN_BASE => {
+            let wi = with_app(|a| a.menu_windows.get(cmd - IDM_PROMPT_WIN_BASE).cloned());
+            if let Some(wi) = wi {
+                prompter::pick(wi.hwnd);
+            }
         }
         _ if cmd >= IDM_WIN_BASE => {
             let idx = cmd - IDM_WIN_BASE;
@@ -474,6 +522,7 @@ fn poll_hover() {
         if GetCursorPos(&mut pt).is_err() {
             return;
         }
+        prompter::poll(pt);
         let (last, moved) = with_app(|a| {
             let moved = pt.x != a.last_pt.x || pt.y != a.last_pt.y;
             if moved {

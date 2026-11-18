@@ -22,6 +22,12 @@ USE
   - Right-click the tray icon 👻 for: the window list (click one to toggle),
     the default-opacity submenu, "hide from screen sharing", "restore all",
     "run at login", and "exit".
+  - Tray -> "提词器" -> "选择窗口…": pick a window, drag to frame the part
+    you want (Enter = whole window, Esc = cancel). A live copy appears at the
+    top centre of the main screen, under a laptop's camera, so your eyes stay
+    near the lens. Only you see it: shares and recordings don't. Drag it to
+    move, drag its edges to resize, click the x in its corner to close.
+    It is a picture: scroll and edit in the original window.
 
 HIDE FROM SCREEN SHARING
   Tray -> "共享/录屏时隐藏" marks ghosted windows so they do not appear in
