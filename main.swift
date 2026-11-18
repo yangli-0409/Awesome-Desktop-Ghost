@@ -791,14 +791,25 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
-/// Over a hidden window, a share would show the cursor moving and clicking over
-/// nothing (and its I-beam would give text fields away). While the mouse is over
+/// Over a hidden window, a share would show the cursor's real shape over nothing:
+/// an I-beam or a hand gives text fields and links away. While the mouse is over
 /// one, hide the system cursor — a private SkyLight switch lets a background app
-/// do that — and draw a local-only copy. The window server brings the real cursor
+/// do that — and draw a local-only copy for you. Shares then see, by default
+/// (arrowInShares), a plain arrow following the mouse, drawn in a captured window
+/// just above the cover; otherwise no cursor at all, which shows as the cursor
+/// vanishing there. Under the hidden window's see-through area you may notice that
+/// arrow faintly behind your own cursor. The window server brings the real cursor
 /// back by itself if Ghost exits.
 final class CursorCloak {
     private let win: NSWindow
     private let image = NSImageView()
+    private let decoy: NSWindow                   // what shares see: a plain arrow
+    var arrowInShares = UserDefaults.standard.object(forKey: "ArrowInShares") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(arrowInShares, forKey: "ArrowInShares")
+            if hidden { arrowInShares ? showDecoy() : decoy.orderOut(nil) }
+        }
+    }
     private var hidden = false
     private var shown: NSCursor?
     private var monitor: Any?
@@ -826,6 +837,35 @@ final class CursorCloak {
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
         image.imageScaling = .scaleAxesIndependently
         win.contentView = image
+
+        let arrow = NSCursor.arrow
+        decoy = NSWindow(contentRect: NSRect(origin: .zero, size: arrow.image.size), styleMask: .borderless,
+                         backing: .buffered, defer: false)
+        decoy.isOpaque = false
+        decoy.backgroundColor = .clear
+        decoy.hasShadow = false
+        decoy.ignoresMouseEvents = true
+        decoy.sharingType = .readOnly
+        decoy.level = shieldLevel                     // with the cover, ordered above it; under your view
+        decoy.animationBehavior = .none
+        decoy.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
+        let iv = NSImageView(frame: NSRect(origin: .zero, size: arrow.image.size))
+        iv.image = arrow.image
+        iv.imageScaling = .scaleAxesIndependently
+        decoy.contentView = iv
+    }
+
+    /// A shield's cover was just put on screen: keep the arrow above it.
+    func raise() { if hidden && arrowInShares { decoy.orderFrontRegardless() } }
+
+    private func showDecoy() {
+        placeDecoy(NSEvent.mouseLocation)
+        decoy.orderFrontRegardless()
+    }
+
+    private func placeDecoy(_ m: NSPoint) {
+        let a = NSCursor.arrow
+        decoy.setFrameOrigin(NSPoint(x: m.x - a.hotSpot.x, y: m.y - (a.image.size.height - a.hotSpot.y)))
     }
 
     var window: NSWindow { win }
@@ -842,6 +882,7 @@ final class CursorCloak {
     func stop() { if hidden { uncloak() } }
 
     private func place(_ m: NSPoint) {
+        if arrowInShares { placeDecoy(m) }
         guard let c = NSCursor.currentSystem else { return }
         let size = c.image.size
         if c !== shown {
@@ -858,6 +899,7 @@ final class CursorCloak {
         CGDisplayHideCursor(kCGNullDirectDisplay)
         place(NSEvent.mouseLocation)
         win.orderFrontRegardless()
+        if arrowInShares { showDecoy() }
         monitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
         ) { [weak self] _ in self?.place(NSEvent.mouseLocation) }
@@ -867,6 +909,7 @@ final class CursorCloak {
         hidden = false
         CGDisplayShowCursor(kCGNullDirectDisplay)
         win.orderOut(nil)
+        decoy.orderOut(nil)
         if let m = monitor { NSEvent.removeMonitor(m) }
         monitor = nil
         shown = nil
@@ -1054,6 +1097,7 @@ final class ShareShield {
                     shields[id] = s
                     s.wantInView(ownWindows)
                     s.start(keys: keys)
+                    cursor.raise()
                 }
                 layoutAll()
             }
@@ -1070,6 +1114,7 @@ final class ShareShield {
         }
         fresh.wantInView(ownWindows)
         fresh.start(keys: keys)
+        cursor.raise()
         var check: Timer?
         check = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             guard let self else { check?.invalidate(); return }
@@ -2119,6 +2164,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let hide = NSMenuItem(title: "共享/录屏时隐藏（只有你能看到）", action: #selector(toggleHideInShares), keyEquivalent: "")
         hide.state = hideInShares ? .on : .off
         menu.addItem(hide)
+        if hideInShares {
+            let arrow = NSMenuItem(title: "    鼠标在隐藏窗口上时，共享里显示为普通箭头", action: #selector(toggleArrowInShares), keyEquivalent: "")
+            arrow.state = shield.cursor.arrowInShares ? .on : .off
+            arrow.toolTip = "关掉后，共享和录屏里鼠标经过隐藏窗口时会消失"
+            menu.addItem(arrow)
+        }
 
         let count = ghosts.count + shield.targets.count
         if count > 0 {
@@ -2154,6 +2205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleHideInShares() { setHideInShares(!hideInShares) }
+    @objc private func toggleArrowInShares() { shield.cursor.arrowInShares.toggle() }
 
     @objc private func setDefaultOpacity(_ sender: NSMenuItem) {
         defaultOpacity = CGFloat(sender.tag) / 100
